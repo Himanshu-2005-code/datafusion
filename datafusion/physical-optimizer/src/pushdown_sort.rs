@@ -111,7 +111,11 @@ impl PhysicalOptimizerRule for PushdownSort {
                         // Use LocalLimitExec (not Global) since input is multi-partition.
                         let inner = if let Some(fetch) = sort_child.fetch() {
                             inner.with_fetch(Some(fetch)).unwrap_or_else(|| {
-                                Arc::new(LocalLimitExec::new(inner, fetch))
+                                let mut limit = LocalLimitExec::new(inner, fetch);
+                                limit.set_required_ordering(Some(
+                                    required_ordering.clone(),
+                                ));
+                                Arc::new(limit)
                             })
                         } else {
                             inner
@@ -171,7 +175,9 @@ impl PhysicalOptimizerRule for PushdownSort {
                     // wrapping with GlobalLimitExec.
                     if let Some(fetch) = sort_exec.fetch() {
                         let inner = inner.with_fetch(Some(fetch)).unwrap_or_else(|| {
-                            Arc::new(GlobalLimitExec::new(inner, 0, Some(fetch)))
+                            let mut limit = GlobalLimitExec::new(inner, 0, Some(fetch));
+                            limit.set_required_ordering(Some(required_ordering.clone()));
+                            Arc::new(limit)
                         });
                         Ok(Transformed::yes(inner))
                     } else {
