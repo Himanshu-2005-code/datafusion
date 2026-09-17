@@ -185,3 +185,18 @@ NULL
 
 statement ok
 set datafusion.spark.map_key_dedup_policy = 'EXCEPTION';
+
+# Regression test for https://github.com/apache/datafusion/issues/25419
+# ORDER BY + LIMIT/OFFSET produces sliced list arrays whose offsets do not
+# start at 0; the keys must still be paired with the values from the same row.
+statement ok
+CREATE TABLE sliced_arrays AS VALUES ([99, 98], [990, 980]), ([1, 2], [10, 20]);
+
+query ?
+SELECT map_from_arrays(column1, column2)
+FROM (SELECT * FROM sliced_arrays ORDER BY column2 DESC LIMIT 1 OFFSET 1) s;
+----
+{1: 10, 2: 20}
+
+statement ok
+DROP TABLE sliced_arrays;

@@ -19,11 +19,9 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanBuilder, Int32Array, MapArray, StructArray,
-};
+use arrow::array::{Array, ArrayRef, AsArray, Int32Array, MapArray, StructArray};
 use arrow::buffer::{NullBuffer, OffsetBuffer};
-use arrow::compute::{filter, take};
+use arrow::compute::take;
 use arrow::datatypes::{DataType, Field, Fields};
 use datafusion_common::{Result, ScalarValue, exec_err};
 
@@ -178,10 +176,13 @@ fn map_deduplicate_keys(
 
     // Mirror Spark's `ArrayBasedMapBuilder`: the first occurrence of a key
     // fixes its position in the output; under LAST_WIN a later duplicate
-    // overwrites that slot's value. `keys_mask` selects the first-seen keys,
-    // `value_indices` records the source index in `flat_values` to materialize
-    // for each output slot (updated in place on overwrite).
-    let mut keys_mask_builder = BooleanBuilder::new();
+    // overwrites that slot's value. `key_indices`/`value_indices` record the
+    // source index in `flat_keys`/`flat_values` to materialize for each
+    // output slot (the value index is updated in place on overwrite). These
+    // are absolute indices into the flattened arrays, which is required
+    // because `flat_keys`/`flat_values` are not rebased to the start of the
+    // (possibly sliced) input lists.
+    let mut key_indices: Vec<i32> = Vec::new();
     let mut value_indices: Vec<i32> = Vec::new();
     let mut key_to_output_idx: HashMap<ScalarValue, usize> = HashMap::new();
     for (row_idx, (next_keys_offset, next_values_offset)) in keys_offsets
@@ -209,12 +210,12 @@ fn map_deduplicate_keys(
                     cur_keys_offset + cur_entry_idx,
                 )?
                 .compacted();
+                let abs_key_idx = (cur_keys_offset + cur_entry_idx) as i32;
                 let abs_value_idx = (cur_values_offset + cur_entry_idx) as i32;
 
                 if let Some(&output_idx) = key_to_output_idx.get(&key) {
                     if last_value_wins {
                         value_indices[output_idx] = abs_value_idx;
-                        keys_mask_builder.append_value(false);
                         continue;
                     }
                     return exec_err!(
@@ -224,22 +225,18 @@ fn map_deduplicate_keys(
                          `datafusion.spark.map_key_dedup_policy` to `LAST_WIN`."
                     );
                 }
-                keys_mask_builder.append_value(true);
-                key_to_output_idx.insert(key, value_indices.len());
+                key_to_output_idx.insert(key, key_indices.len());
+                key_indices.push(abs_key_idx);
                 value_indices.push(abs_value_idx);
                 new_last_offset += 1;
             }
-        } else {
-            // The result entry is NULL — no keys/values emitted. Still pad the
-            // mask so it stays aligned with `flat_keys`.
-            keys_mask_builder.append_n(num_keys_entries, false);
         }
         new_offsets.push(new_last_offset);
         cur_keys_offset += num_keys_entries;
         cur_values_offset += num_values_entries;
     }
-    let keys_mask = keys_mask_builder.finish();
-    let needed_keys = filter(&flat_keys, &keys_mask)?;
+    let key_indices_array = Int32Array::from(key_indices);
+    let needed_keys = take(&flat_keys, &key_indices_array, None)?;
     let value_indices_array = Int32Array::from(value_indices);
     let needed_values = take(&flat_values, &value_indices_array, None)?;
     let offsets = OffsetBuffer::new(new_offsets.into());
@@ -341,6 +338,40 @@ mod tests {
         let map = result.as_map();
         assert_eq!(map.len(), 1);
         assert_eq!(map.value_offsets(), &[0, 0]);
+    }
+
+    #[test]
+    fn offsets_not_starting_at_zero_use_absolute_indices() {
+        // Simulates a sliced list array: `flat_keys`/`flat_values` still hold
+        // all rows' data, but `keys_offsets`/`values_offsets` only describe a
+        // single row whose entries start partway through the flat arrays
+        // (as happens after an upstream operator like LIMIT/OFFSET slices
+        // the input). The keys must still be paired with the values from
+        // that same row, not with whatever happens to sit at the start of
+        // the flat arrays.
+        let (keys, values) = int32_utf8_inputs(
+            vec![99, 98, 1, 2],
+            vec![Some("dummy1"), Some("dummy2"), Some("a"), Some("b")],
+        );
+        let offsets = [2i32, 4];
+
+        let result = map_from_keys_values_offsets_nulls(
+            &keys, &values, &offsets, &offsets, None, None, false,
+        )
+        .unwrap();
+
+        let map = result.as_map();
+        assert_eq!(map.len(), 1);
+        let entries = map.value(0);
+        let keys_col = entries
+            .column(0)
+            .as_primitive::<arrow::datatypes::Int32Type>();
+        let values_col = entries.column(1).as_string::<i32>();
+        assert_eq!(keys_col.values(), &[1, 2]);
+        assert_eq!(
+            values_col.iter().collect::<Vec<_>>(),
+            vec![Some("a"), Some("b")]
+        );
     }
 
     #[test]
