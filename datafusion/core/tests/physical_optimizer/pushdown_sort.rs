@@ -35,7 +35,10 @@ use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 use datafusion_physical_optimizer::PhysicalOptimizerRule;
 use datafusion_physical_optimizer::pushdown_sort::PushdownSort;
+use datafusion_physical_plan::buffer::BufferExec;
 use datafusion_physical_plan::collect;
+use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
+use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use std::sync::Arc;
 
 use crate::physical_optimizer::test_utils::{
@@ -43,7 +46,7 @@ use crate::physical_optimizer::test_utils::{
     parquet_exec, parquet_exec_with_sort, projection_exec, projection_exec_with_alias,
     repartition_exec, schema, simple_projection_exec, sort_exec, sort_exec_with_fetch,
     sort_exec_with_fetch_and_preserve_partitioning, sort_expr, sort_expr_named,
-    test_scan_with_ordering,
+    sort_preserving_merge_exec, test_scan_with_ordering,
 };
 
 #[test]
@@ -1148,10 +1151,10 @@ fn test_sort_pushdown_exact_preserves_fetch_with_global_limit() {
         Arc::new(TestScan::new(schema.clone(), vec![]).with_exact_pushdown(true));
 
     let ordering = LexOrdering::new(vec![a]).unwrap();
-    let plan = sort_exec_with_fetch(ordering, Some(10), source);
+    let plan = sort_exec_with_fetch(ordering.clone(), Some(10), source);
 
     insta::assert_snapshot!(
-        OptimizationTest::new(plan, PushdownSort::new(), true),
+        OptimizationTest::new(Arc::clone(&plan), PushdownSort::new(), true),
         @r"
     OptimizationTest:
       input:
@@ -1163,6 +1166,57 @@ fn test_sort_pushdown_exact_preserves_fetch_with_global_limit() {
           -   TestScan: requested_ordering=[a@0 ASC]
     "
     );
+
+    // The snapshot does not display `required_ordering`, so assert it directly:
+    // the replacement limit must stay order-sensitive for later passes.
+    let optimized = PushdownSort::new()
+        .optimize(plan, &sort_pushdown_config())
+        .unwrap();
+    let limit = optimized.downcast_ref::<GlobalLimitExec>().unwrap();
+    assert_eq!(limit.required_ordering().as_ref(), Some(&ordering));
+}
+
+#[test]
+fn test_sort_pushdown_exact_spm_preserves_fetch_with_local_limit() {
+    // SPM -> SortExec(preserve_partitioning) over a multi-partition source that
+    // returns Exact but does NOT support with_fetch(): the eliminated SortExec's
+    // fetch is preserved with a LocalLimitExec (input is multi-partition), and
+    // that limit must carry the required ordering.
+    let schema = schema();
+    let a = sort_expr("a", &schema);
+    let source = Arc::new(
+        TestScan::new(schema.clone(), vec![])
+            .with_exact_pushdown(true)
+            .with_partition_count(2),
+    );
+
+    let ordering = LexOrdering::new(vec![a]).unwrap();
+    let sort = sort_exec_with_fetch_and_preserve_partitioning(
+        ordering.clone(),
+        Some(10),
+        source,
+    );
+    let plan = sort_preserving_merge_exec(ordering.clone(), sort);
+
+    let optimized = PushdownSort::new()
+        .optimize(plan, &sort_pushdown_config())
+        .unwrap();
+    let spm = optimized
+        .downcast_ref::<SortPreservingMergeExec>()
+        .expect("SortPreservingMergeExec should be kept");
+    let buffer = spm.input();
+    assert!(buffer.downcast_ref::<BufferExec>().is_some());
+    let limit = buffer.children()[0]
+        .downcast_ref::<LocalLimitExec>()
+        .expect("fetch should be preserved with a LocalLimitExec");
+    assert_eq!(limit.fetch(), 10);
+    assert_eq!(limit.required_ordering().as_ref(), Some(&ordering));
+}
+
+fn sort_pushdown_config() -> ConfigOptions {
+    let mut config = ConfigOptions::new();
+    config.optimizer.enable_sort_pushdown = true;
+    config
 }
 
 #[test]
